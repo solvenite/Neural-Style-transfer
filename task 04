@@ -1,0 +1,113 @@
+# Install dependencies (if needed)
+!pip install torch torchvision matplotlib pillow --quiet
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms, models
+from PIL import Image
+import matplotlib.pyplot as plt
+from google.colab import files
+import io
+print("Upload your content image:")
+content_upload = files.upload()
+content_path = next(iter(content_upload))
+
+print("Upload your style image:")
+style_upload = files.upload()
+style_path = next(iter(style_upload))
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def load_image(path, max_size=400, shape=None):
+    image = Image.open(path).convert('RGB')
+    
+    size = max_size if max(image.size) > max_size else max(image.size)
+    if shape is not None:
+        size = shape
+
+    in_transform = transforms.Compose([
+        transforms.Resize((size, size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
+
+    image = in_transform(image)[:3, :, :].unsqueeze(0)
+    return image.to(device)
+
+def im_convert(tensor):
+    image = tensor.to("cpu").clone().detach()
+    image = image.squeeze(0)
+    image = image * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    image = image + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    image = image.clamp(0, 1)
+    return transforms.ToPILImage()(image)
+vgg = models.vgg19(pretrained=True).features.to(device).eval()
+
+for param in vgg.parameters():
+    param.requires_grad_(False)
+
+content = load_image(content_path)
+style = load_image(style_path, shape=content.shape[-2:])
+
+def get_features(image, model, layers=None):
+    features = {}
+    x = image
+    i = 0
+    for name, layer in model._modules.items():
+        x = layer(x)
+        if f'conv{i}_{1}' in layers:
+            features[f'conv{i}_{1}'] = x
+        if f'conv{i}_{2}' in layers:
+            features[f'conv{i}_{2}'] = x
+        if isinstance(layer, nn.Conv2d):
+            i += 1
+    return features
+
+def gram_matrix(tensor):
+    _, d, h, w = tensor.size()
+    tensor = tensor.view(d, h * w)
+    return torch.mm(tensor, tensor.t())
+
+content_layers = ['conv4_2']
+style_layers = ['conv1_1', 'conv2_1', 'conv3_1', 'conv4_1', 'conv5_1']
+
+content_features = get_features(content, vgg, content_layers)
+style_features = get_features(style, vgg, style_layers)
+style_grams = {layer: gram_matrix(style_features[layer]) for layer in style_features}
+target = content.clone().requires_grad_(True).to(device)
+optimizer = optim.Adam([target], lr=0.003)
+bce = nn.MSELoss()
+style_weight = 1e6
+content_weight = 1
+
+for step in range(1, 301):
+    target_features = get_features(target, vgg, set(content_layers + style_layers))
+    content_loss = torch.mean((target_features['conv4_2'] - content_features['conv4_2'])**2)
+
+    style_loss = 0
+    for layer in style_layers:
+        target_feature = target_features[layer]
+        target_gram = gram_matrix(target_feature)
+        style_gram = style_grams[layer]
+        layer_style_loss = torch.mean((target_gram - style_gram)**2)
+        _, d, h, w = target_feature.shape
+        style_loss += layer_style_loss / (d * h * w)
+
+    total_loss = content_weight * content_loss + style_weight * style_loss
+
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    if step % 50 == 0:
+        print(f"Step {step}, Loss: {total_loss.item():.4f}")
+final_img = im_convert(target)
+plt.figure(figsize=(8,8))
+plt.imshow(final_img)
+plt.axis('off')
+plt.title('Stylized Output')
+plt.show()
+
+# Download
+final_img.save("stylized_output.png")
+files.download("stylized_output.png")
